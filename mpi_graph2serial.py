@@ -51,6 +51,58 @@ class MPIGraph(Chare):
     def get_weights(self) -> List[int]:
         return self.G.weights
 
+    @coro
+    def write_mpi_graph(self, filename: str):
+        print("write_mpi_graph started to", filename)
+        G = self.G
+        with open(filename, "wb") as out_file:
+            # n
+            out_file.write(pack(vertex_id_tf, G.n))
+            # arity
+            arity = G.m // G.n
+            out_file.write(pack(edge_id_tf, arity))
+            # directed
+            out_file.write(pack(bool_tf, G.directed))
+            # align
+            align = 0
+            out_file.write(pack(uint8_tf, align))
+            # rows_indices
+            start_rows_index = 0
+            for rank in range(charm.numPes()):
+                if rank == self.thisIndex:
+                    rows_indices = self.G.rows_indices
+                else:
+                    rows_indices = self.thisProxy[rank].get_rows_indices(ret=True).get()
+                last_rows_index = rows_indices.pop(-1)
+                for rows_index in rows_indices:
+                    out_file.write(pack(edge_id_tf, start_rows_index + rows_index))
+                start_rows_index += last_rows_index
+            out_file.write(pack(edge_id_tf, start_rows_index))
+            # end_v
+            for rank in range(charm.numPes()):
+                if rank == self.thisIndex:
+                    end_v = self.G.end_v
+                else:
+                    end_v = self.thisProxy[rank].get_end_v(ret=True).get()
+                for end_vertex in end_v:
+                    out_file.write(pack(vertex_id_tf, end_vertex))
+            # n_root
+            out_file.write(pack(vertex_id_tf, G.n_roots))
+            # roots
+            for i in range(G.n_roots):
+                out_file.write(pack(vertex_id_tf, G.roots[i]))
+            # num_traversed_edges
+            for i in range(G.n_roots):
+                out_file.write(pack(edge_id_tf, G.num_traversed_edges[i]))
+            # weights
+            for rank in range(charm.numPes()):
+                if rank == self.thisIndex:
+                    weights = self.G.weights
+                else:
+                    weights = self.thisProxy[rank].get_weights(ret=True).get()
+                for weight in weights:
+                    out_file.write(pack(weight_tf, weight))
+        print("write_mpi_graph finished")
 
 
 def main(args):
@@ -61,7 +113,6 @@ def main(args):
         is_mpi = sys.argv[2] == "True"
     print(f"is_mpi={is_mpi}")
     group_proxy = Group(MPIGraph)
-
 
     if is_mpi:
         # Читаем граф из mpi файлов на разные процессы
@@ -76,6 +127,9 @@ def main(args):
         for rank in range(charm.numPes()):
             group_proxy[rank].read_graph(filename, is_mpi, awaitable=True).get()
 
+
+    # Записать граф на 0 процессе
+    group_proxy[0].write_mpi_graph(f"{filename}_mpi_graph2serial", awaitable=True).get()
     exit()
 
 
