@@ -1,9 +1,6 @@
 import os
 import sys
 import time
-import numpy as np
-# sys.path.append(os.path.join(os.path.dirname(__file__), "charm4py"))
-
 
 import graph
 from graph import Graph
@@ -13,7 +10,7 @@ from charm4py import charm, Chare, Group, coro, Channel, Reducer
 
 
 class Process(Chare):
-    MAX_NUMBER = 10**15
+    MAX_NUMBER = 10**9
 
     def set_process_vertices(self):
         local_n = self.G.n // charm.numPes()
@@ -42,7 +39,6 @@ class Process(Chare):
         self.G.roots = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         self.G.num_traversed_edges = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         self.G.first_vertex = self.G.local_n * self.thisIndex
-        # print(self.G)
 
         self.channels = [Channel(self, remote=self.thisProxy[rank]) for rank in range(charm.numPes())]
         self.channels.pop(self.thisIndex)
@@ -50,220 +46,147 @@ class Process(Chare):
 
     @coro
     def sssp(self, delta: float = None):
-        start_time = time.time()
         if delta is None:
-            delta = self.G.n / self.G.m
+            delta = (self.G.n / self.G.m)
         self.delta = delta
-        # Массив вершин (свой на каждом процессе)
-        self.vertices = set(range(self.G.first_vertex, self.G.first_vertex + self.G.local_n))
-        # Массив расстояний. По умолчанию все значения -1 (max float, но жалко память), кроме корня, там 0
-        # self.self_distances = [-1.0] * self.G.n
-        # if self.thisIndex == 0:
-        #     self.self_distances[0] = 0
-        # расстояния до вершин других процессов
-        self.distances_map = {nb_rank: {} for nb_rank in range(charm.numPes())}
-        self.distances_map[self.thisIndex] = {vi: self.MAX_NUMBER for vi in range(self.G.local_n)}
-        if self.thisIndex == 0:
-            # self.vertices = set(range(self.G.first_vertex + 1, self.G.first_vertex + self.G.local_n))
-            self.buckets = {self.MAX_NUMBER: self.vertices}
-            self.buckets[0] = set([0])
-            self.distances_map[0][0] = 0
-        else:
-            self.buckets = {self.MAX_NUMBER: self.vertices}
-        # Каналы к другим процессам
-        # self.channels = [Channel(self, remote=self.thisProxy[rank]) for rank in range(charm.numPes())]
-        # self.channels.pop(self.thisIndex)
 
+        # print(f"Process {self.thisIndex}: {self.G.params_str()} \nfirst_vertex: {self.G.first_vertex}\ndelta: {delta}")
+
+        self.distances_map = {
+            vertex: self.MAX_NUMBER for vertex in self.G.end_v
+        }
+        self.distances_map.update(
+            (vertex + self.G.first_vertex, self.MAX_NUMBER) for vertex in range(self.G.local_n)
+        )
+
+        self.buckets = {self.MAX_NUMBER: set(vertex + self.G.first_vertex for vertex in range(self.G.local_n))}
         self.bucket_index = 0
 
-        # self.updated_distances_map_indexes = [0] * charm.numPes()
+        if self.thisIndex == 0:
+            self.distances_map[0] = 0
+            self.buckets[self.MAX_NUMBER].remove(0)
+            self.buckets[self.bucket_index] = set([0])        
 
-        # print("VVVVVV", self.thisIndex, self.vertices)
-
-        iter = 1 # for debug
-        while True and iter > 0:
-            # iter -= 1
+        start_time = time.time()
+        while True:
             # Выбирается минимальный bucket_index всех процессов
             self.bucket_index = self.allreduce(self.bucket_index, Reducer.min).get()
-            # print(f"Process {self.thisIndex} bucket_index: {self.bucket_index}", flush=True)
             if self.bucket_index == self.MAX_NUMBER:
                 break
 
             self.buckets.setdefault(self.bucket_index, set())
             self.process_bucket()
-            # print(f"Process {self.thisIndex} buckets count={len(self.buckets)}")
 
+            # Выбирается минимальный bucket_index данного процесса
             min_bucket_index = self.MAX_NUMBER
             for bucket_index in list(self.buckets):
-                bucket = self.buckets[bucket_index]
-                if bucket_index <= self.bucket_index or len(bucket) == 0:
+                if bucket_index <= self.bucket_index or len(self.buckets[bucket_index]) == 0:
                     self.buckets.pop(bucket_index)
                 else:
                     min_bucket_index = bucket_index if bucket_index < min_bucket_index else min_bucket_index
             self.bucket_index = min_bucket_index
 
-            # self.bucket_index = min(
-            #     k for k, v in self.buckets.items()
-            #     if len(v) > 0 and k > self.bucket_index
-            # )
-
-        # self.allreduce(self.bucket_index, Reducer.min).get()
-
-        # print(f"ANS Process {self.thisIndex}: {self.distances_map[self.thisIndex]}", flush=True)
         finish_time = time.time()
         elapsed_time = finish_time - start_time
-        print(f"Process {self.thisIndex} Elapsed time: {elapsed_time} s", flush=True)
-        return
-    
-    def update_bucket(self, vertices: np.array, distances: np.array) -> None:
-        # self.work_bucket.update(bucket)
-        # for sv in bucket:
-        #     if sv // self.G.local_n == self.thisIndex:
-        self.work_bucket.update(vertices)
-        v_distances = self.distances_map[self.thisIndex]
-        for v_index in range(len(vertices)):
-            vertex = vertices[v_index]
-            if distances[v_index] < v_distances[vertex % self.G.local_n]:
-                v_distances[vertex % self.G.local_n] = distances[v_index]
+        # print(f"Process {self.thisIndex} Elapsed time: {elapsed_time} s", flush=True)
+
+    def update_work_bucket(self, vertices_distance: dict):
+        self.work_bucket.update(vertices_distance)
+        self.buckets[self.bucket_index].update(vertices_distance)
+        for vertex, new_distance in vertices_distance.items():
+            if new_distance < self.distances_map.get(vertex, self.MAX_NUMBER):
+                bucket_index = int(self.distances_map.get(vertex, self.MAX_NUMBER) / self.delta)
+                new_bucket_index = int(new_distance / self.delta)
+
+                if new_bucket_index < bucket_index:
+                    if new_bucket_index in self.buckets:
+                        self.buckets[new_bucket_index].add(vertex)
+                    else:
+                        self.buckets[new_bucket_index] = set([vertex])
+                    if bucket_index in self.buckets:
+                        self.buckets[bucket_index].discard(vertex)
+                
+                self.distances_map[vertex] = new_distance
 
     def process_bucket(self):
-        self.work_bucket = self.buckets.get(self.bucket_index, set()).copy()
+        self.work_bucket = self.buckets[self.bucket_index].copy()
 
-        # self.updated_vertices = [[] for _ in range(self.G.local_n)]
-        # for v_index, v_distance in self.distances_map[self.thisIndex].items():
-        #     self.updated_vertices[v_index] = [v_distance]
-
-        tmp = 0
-        while True and tmp < 10:
-            # tmp += 1
-
+        while True:
             if self.allreduce(len(self.work_bucket), Reducer.max).get() == 0:
                 break
-            # Синхронизировать buckets
+
+            # Синхронизировать buckets and distances_map
+            vertices_distance_by_rank = {}
+            for vertex in self.work_bucket:
+                vertices_distance_by_rank[vertex] = self.distances_map[vertex]
+
             futures = []
-            # is_empty_work_bucket = len(self.work_bucket) == 0
-
-            send_vertices = {rank: ([], []) for rank in range(charm.numPes())}
-            for sv in self.work_bucket:
-                rank = sv // self.G.local_n
-
-                send_vertices[rank][0].append(sv)
-                send_vertices[rank][1].append(self.distances_map[rank][sv % self.G.local_n])
-
             for rank in range(charm.numPes()):
-                # print(f"Process {self.thisIndex}; Rank {rank}; {len(self.work_bucket)} {len(send_vertices[rank][0])}")
-                if rank != self.thisIndex and len(send_vertices[rank][0]) > 0:
-                    # send_vertices = {
-                    #     sv: self.distances_map[rank][sv % self.G.local_n]
-                    #     for sv in self.work_bucket if sv // self.G.local_n == rank
-                    # }
-                    # if len(send_vertices) > 0:
-                    futures.append(
-                        self.thisProxy[rank].update_bucket(
-                            np.array(send_vertices[rank][0], dtype=int), np.array(send_vertices[rank][1], dtype=float), awaitable=True)
+                if rank != self.thisIndex and len(vertices_distance_by_rank) > 0:
+                              futures.append(
+                        self.thisProxy[rank].update_work_bucket(
+                            vertices_distance_by_rank, awaitable=True)
                     ) 
-            
-            # print(self.thisIndex, len(futures))
             for future in futures:
                 future.get()
+
+
             if self.allreduce(len(self.work_bucket), Reducer.max).get() == 0:
                 break
-
-
-            # rank = 0
-            # for channel in self.channels:
-            #     if rank == self.thisIndex:
-            #         rank += 1
-            #     channel.send(np.array(send_vertices[rank][0], dtype=int), np.array(send_vertices[rank][1], dtype=float))
-            #     rank += 1
-            
-            # v_distances = self.distances_map[self.thisIndex]
-            # for channel in charm.iwait(self.channels):
-            #     cur_vertices, cur_distances = channel.recv()
-            #     self.work_bucket.update(cur_vertices)
-            #     for v_index in range(len(cur_vertices)):
-            #         vertex = cur_vertices[v_index]
-            #         if cur_distances[v_index] < v_distances[vertex % self.G.local_n]:
-            #             v_distances[vertex % self.G.local_n] = cur_distances[v_index]
-            # print(self.thisIndex, len(futures))
-
-
-            self.buckets[self.bucket_index].update(self.work_bucket)
-            del send_vertices
-            
+            del vertices_distance_by_rank
 
             updated_vertices = set()
             for sv in self.work_bucket:
                 sv_index = sv - self.G.first_vertex
-                # Вершина не этого процесса
-                if sv not in self.vertices:
+                if not (0 <= sv_index < self.G.local_n):
                     continue
-                # if sv_index not in self.distances_map[self.thisIndex]:
-                #     continue
-                # print(f"Process {self.thisIndex}", "VERTEX:", sv, list(range(self.G.rows_indices[sv_index], self.G.rows_indices[sv_index + 1])), flush=True)
-                for dv_index_in_end_v in range(self.G.rows_indices[sv_index], self.G.rows_indices[sv_index + 1]):
-                    self.relax(sv_index, dv_index_in_end_v, updated_vertices)
-            # print(f"Process {self.thisIndex}", "NEW self.buckets:", self.buckets, self.distances_map, flush=True)
+                for ev_index_in_end_v in range(self.G.rows_indices[sv_index], self.G.rows_indices[sv_index + 1]):
+    
+                    self.relax(sv, ev_index_in_end_v, updated_vertices)
             self.work_bucket = self.buckets[self.bucket_index].intersection(updated_vertices)
-            
-    def relax(self, sv_index: int, dv_index_in_end_v: int, updated_vertices: set):
-        # print("relax", end=' ')
-        dv = self.G.end_v[dv_index_in_end_v]
-        is_updated = False
 
-        dv_process_rank = dv // self.G.local_n
-        dv_index = dv % self.G.local_n
-        # print("START", sv_index, dv_index_in_end_v, updated_vertices)
-        sv_to_dv = self.distances_map[dv_process_rank].get(dv_index, self.MAX_NUMBER)
-        sv_to_dv_updated = self.distances_map[self.thisIndex][sv_index] + self.G.weights[dv_index_in_end_v]
+    def relax(self, sv: int, ev_index_in_end_v: int, updated_vertices: set):
+        ev = self.G.end_v[ev_index_in_end_v]
 
-        dv_bucket_index = int(sv_to_dv / self.delta)
-        dv_bucket_index_updated = int(sv_to_dv_updated / self.delta)
+        dist_to_ev = self.distances_map[ev]
+        dist_to_ev_from_sv = self.distances_map[sv] + self.G.weights[ev_index_in_end_v]
 
-        if sv_to_dv_updated < sv_to_dv:
-            self.distances_map[dv_process_rank][dv_index] = sv_to_dv_updated
-            # self.updated_distances_map_indexes[dv_process_rank] = 1
-            if dv_bucket_index_updated == self.bucket_index:
-                updated_vertices.add(dv)
-        # print(sv_index, dv_index_in_end_v, updated_vertices, dv_bucket_index, dv_bucket_index_updated)
-        if dv_bucket_index_updated < dv_bucket_index:
-            # Переместить между buckets
-            if dv_bucket_index_updated in self.buckets:
-                self.buckets[dv_bucket_index_updated].add(dv)
+        ev_bucket_index = int(dist_to_ev / self.delta)
+        ev_from_sv_bucket_index = int(dist_to_ev_from_sv / self.delta)
+
+        if dist_to_ev_from_sv < dist_to_ev:
+            self.distances_map[ev] = dist_to_ev_from_sv
+            if ev_from_sv_bucket_index == self.bucket_index:
+                updated_vertices.add(ev)
+
+        if ev_from_sv_bucket_index < ev_bucket_index:
+            if ev_from_sv_bucket_index in self.buckets:
+                self.buckets[ev_from_sv_bucket_index].add(ev)
             else:
-                self.buckets[dv_bucket_index_updated] = set([dv])
-            if dv_bucket_index in self.buckets:
-                self.buckets[dv_bucket_index].discard(dv)
+                self.buckets[ev_from_sv_bucket_index] = set([ev])
+            if ev_bucket_index in self.buckets:
+                self.buckets[ev_bucket_index].discard(ev)
 
-            # if dv_bucket_index_updated == self.bucket_index:
-            #     self.updated_distances_map_indexes[dv_process_rank] = 1
-
+    def get_self_distances(self):
+        return [self.distances_map[vertex] for vertex in range(self.G.first_vertex, self.G.first_vertex + self.G.local_n)]
+    
     @coro
     def write_distance(self, filename: str) -> None:
         if self.thisIndex == 0:
             print("write_distance started")
-            distances_map = {0: self.distances_map[self.thisIndex]}
             with open(filename, "wb") as out_file:
-                for channel in charm.iwait(self.channels):
-                    rank, distances = channel.recv()
-                    distances_map[rank] = distances
-                for rank, distances in sorted(distances_map.items()):
-                    for v_index, distance in sorted(distances.items()):
+                for rank in range(charm.numPes()):
+                    for distance in self.thisProxy[rank].get_self_distances(ret=True).get():
+                        if distance == self.MAX_NUMBER:
+                            distance = -1
                         out_file.write(pack(graph.weight_tf, distance))
             print("write_distance finished")
-            # print([distance for rank, distances in sorted(distances_map.items()) for v_index, distance in sorted(distances.items())])
-        else:
-            self.channels[0].send(self.thisIndex, self.distances_map[self.thisIndex])
-
-
     
-
 
 def main(args):
     print('\nRunning sssp Graph on', charm.numPes(), 'processors')
     filename = sys.argv[1]
     group_proxy = Group(Process)
-    # charm.options.profiling = True
 
     is_mpi = False
     if len(sys.argv) > 2:
@@ -291,7 +214,6 @@ def main(args):
         futures.append(group_proxy[rank].sssp(awaitable=True))
     for future in futures:
         future.get()
-    # charm.wait([group_proxy[rank].sssp(awaitable=True) for rank in range(charm.numPes())])
     finish_time = time.time()
 
     # Записываем результирующие расстояния в один файл
@@ -300,7 +222,6 @@ def main(args):
         futures.append(group_proxy[rank].write_distance(filename + "_mpi_ans", awaitable=True))
     for future in futures:
         future.get()
-    # charm.wait([group_proxy[rank].write_distance(filename + "_mpi_ans", awaitable=True) for rank in range(charm.numPes())])
 
     elapsed_time = finish_time - start_time
     print(f"Elapsed time: {elapsed_time} s", flush=True)
